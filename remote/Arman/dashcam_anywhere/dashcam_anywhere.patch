@@ -1,0 +1,726 @@
+diff -ruN orig/common/dashcam_anywhere.py new/common/dashcam_anywhere.py
+--- orig/common/dashcam_anywhere.py	1969-12-31 19:00:00.000000000 -0500
++++ new/common/dashcam_anywhere.py	2026-10-03 15:13:40.945848696 -0400
+@@ -0,0 +1,25 @@
++"""
++dashcam-anywhere: run this device as a pure dashcam on vehicles/robots without a car harness
++(no ignition signal, no CAN). It goes onroad whenever powered, never controls anything, and
++calibrates the camera from GPS / visual-odometry speed instead of CAN wheel speed.
++
++  touch /data/force_onroad    enable  (reboot to apply)
++  rm /data/force_onroad       disable (reboot to apply)
++  touch /data/reset_calib     restart camera calibration from scratch (consumed by calibrationd)
++
++Keep this module dependency-free and without import-time side effects: it is imported by
++manager-preimported daemons, the UI and tests.
++"""
++import os
++
++FLAG = "/data/force_onroad"
++RESET_CALIB_FLAG = "/data/reset_calib"
++CALIB_MARKER = "/data/calib_from_dashcam"  # CalibrationParams were learned in dashcam mode
++
++# Evaluated once: manager pre-imports every process module and forks the daemons from it,
++# so the whole system sees the value from manager start until the next reboot.
++ENABLED = os.path.isfile(FLAG)
++
++
++def enabled() -> bool:
++  return ENABLED
+diff -ruN orig/selfdrive/car/card.py new/selfdrive/car/card.py
+--- orig/selfdrive/car/card.py	2026-10-03 15:13:32.623799244 -0400
++++ new/selfdrive/car/card.py	2026-10-03 15:15:07.699231740 -0400
+@@ -7,6 +7,7 @@
+ 
+ from cereal import car, log
+ 
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.params import Params
+ from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper
+ from openpilot.common.swaglog import cloudlog, ForwardingHandler
+@@ -15,7 +16,7 @@
+ from opendbc.car.can_definitions import CanData, CanRecvCallable, CanSendCallable
+ from opendbc.car.carlog import carlog
+ from opendbc.car.fw_versions import ObdCallback
+-from opendbc.car.car_helpers import get_car, interfaces
++from opendbc.car.car_helpers import get_car, get_demo_car_params, interfaces
+ from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
+ from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
+ from openpilot.selfdrive.car.cruise import VCruiseHelper
+@@ -81,7 +82,16 @@
+ 
+     is_release = self.params.get_bool("IsReleaseBranch")
+ 
+-    if CI is None:
++    if CI is None and dashcam_anywhere.enabled():
++      # dashcam-anywhere: no car here. Don't wait for CAN or fingerprint (no VIN/FW queries are sent),
++      # run as the MOCK dashcam car, which is passive with noOutput safety below
++      cloudlog.warning("dashcam_anywhere: forcing MOCK car, skipping CAN wait and fingerprinting")
++      CP = get_demo_car_params()
++      CP.fingerprintSource = structs.CarParams.FingerprintSource.fixed
++      self.CI = interfaces[CP.carFingerprint](CP)
++      self.RI = interfaces[CP.carFingerprint].RadarInterface(CP)
++      self.CP = self.CI.CP
++    elif CI is None:
+       # wait for one pandaState and one CAN packet
+       print("Waiting for CAN messages...")
+       while True:
+@@ -137,6 +147,13 @@
+         else:
+           cloudlog.warning("Saved SecOC key is invalid")
+ 
++    if dashcam_anywhere.enabled():
++      # interlock: this mode must never write CarParams that allow the panda to send anything
++      sc = self.CP.safetyConfigs
++      if not (self.CP.brand == "mock" and self.CP.passive and len(sc) == 1 and
++              sc[0].safetyModel == structs.CarParams.SafetyModel.noOutput):
++        raise RuntimeError("dashcam_anywhere: refusing to write non-noOutput CarParams")
++
+     # Write previous route's CarParams
+     prev_cp = self.params.get("CarParamsPersistent")
+     if prev_cp is not None:
+@@ -148,6 +165,13 @@
+     self.params.put("CarParamsCache", cp_bytes)
+     self.params.put("CarParamsPersistent", cp_bytes)
+ 
++    if dashcam_anywhere.enabled():
++      # a passive card never runs controls_update(), and the MOCK path skips the fingerprinting step that
++      # sets FirmwareQueryDone. pandad needs both to apply the CarParams safety (noOutput) instead of ELM327.
++      # Both are cleared on every onroad transition, so set them on every start.
++      self.params.put_bool("FirmwareQueryDone", True, block=True)
++      self.params.put_bool("ControlsReady", True, block=True)
++
+     self.v_cruise_helper = VCruiseHelper(self.CP)
+ 
+     self.is_metric = self.params.get_bool("IsMetric")
+diff -ruN orig/selfdrive/locationd/calibrationd.py new/selfdrive/locationd/calibrationd.py
+--- orig/selfdrive/locationd/calibrationd.py	2026-10-03 15:13:33.051801788 -0400
++++ new/selfdrive/locationd/calibrationd.py	2026-10-03 15:54:51.825548989 -0400
+@@ -7,6 +7,7 @@
+ '''
+ 
+ import os
++import time
+ import capnp
+ import numpy as np
+ from typing import NoReturn
+@@ -14,15 +15,27 @@
+ from cereal import log, car
+ import cereal.messaging as messaging
+ from openpilot.system.hardware import HARDWARE
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.constants import CV
++from openpilot.common.gps import get_gps_location_service
+ from openpilot.common.params import Params
+ from openpilot.common.realtime import config_realtime_process
+ from openpilot.common.transformations.orientation import rot_from_euler, euler_from_rot
+ from openpilot.common.swaglog import cloudlog
+ 
+-MIN_SPEED_FILTER = 15 * CV.MPH_TO_MS
+-MAX_VEL_ANGLE_STD = np.radians(0.25)
++# dashcam-anywhere: no CAN wheel speed and slow (<= ~10 km/h) vehicles. Read once per process (reboot to apply).
++DASHCAM = dashcam_anywhere.enabled()
++
++if DASHCAM:
++  MIN_SPEED_FILTER = 9 * CV.KPH_TO_MS  # also shown in the "Drive Above" alert
++  MAX_VEL_ANGLE_STD = np.radians(1.0)  # low-speed pose is noisier per sample, blocks average it out
++else:
++  MIN_SPEED_FILTER = 15 * CV.MPH_TO_MS
++  MAX_VEL_ANGLE_STD = np.radians(0.25)
+ MAX_YAW_RATE_FILTER = np.radians(2)  # per second
++YAW_RATE_REF_SPEED = 15 * CV.MPH_TO_MS  # dashcam: yaw rate gate is scaled down below this speed
++GPS_MAX_AGE = 2.0  # s
++GPS_MAX_SPEED_STD = 1.0  # m/s
+ 
+ MAX_HEIGHT_STD = np.exp(-3.5)
+ 
+@@ -60,6 +73,10 @@
+ def moving_avg_with_linear_decay(prev_mean: np.ndarray, new_val: np.ndarray, idx: int, block_size: float) -> np.ndarray:
+   return (idx*prev_mean + (block_size - idx) * new_val) / block_size
+ 
++def running_mean(prev_mean: np.ndarray, new_val: np.ndarray, idx: int, block_size: float) -> np.ndarray:
++  # equal weight for every sample in the block, idx == 0 still overwrites the recycled slot
++  return (idx*prev_mean + new_val) / (idx + 1)
++
+ class Calibrator:
+   def __init__(self, param_put: bool = False):
+     self.param_put = param_put
+@@ -169,6 +186,11 @@
+     if self.param_put and write_this_cycle:
+       self.params.put("CalibrationParams", self.get_msg(True).to_bytes())
+ 
++  def reset_calibration(self) -> None:
++    self.reset()
++    self.cal_status = log.LiveCalibrationData.Status.uncalibrated  # recalibrating is sticky in update_status
++    self.update_status()
++
+   def handle_v_ego(self, v_ego: float) -> None:
+     self.v_ego = v_ego
+ 
+@@ -186,7 +208,12 @@
+                             road_transform_trans_std: list[float]) -> np.ndarray | None:
+     self.old_rpy_weight = max(0.0, self.old_rpy_weight - 1/SMOOTH_CYCLES)
+ 
+-    straight_and_fast = ((self.v_ego > MIN_SPEED_FILTER) and (trans[0] > MIN_SPEED_FILTER) and (abs(rot[2]) < MAX_YAW_RATE_FILTER))
++    yaw_rate_limit = MAX_YAW_RATE_FILTER
++    if DASHCAM:
++      # while turning, the camera ahead of the rotation center sees a lateral velocity that reads as yaw.
++      # Keep the max accepted curvature what it is at YAW_RATE_REF_SPEED
++      yaw_rate_limit *= min(1.0, max(trans[0], 0.0) / YAW_RATE_REF_SPEED)
++    straight_and_fast = ((self.v_ego > MIN_SPEED_FILTER) and (trans[0] > MIN_SPEED_FILTER) and (abs(rot[2]) < yaw_rate_limit))
+     angle_std_threshold = MAX_VEL_ANGLE_STD
+     height_std_threshold = MAX_HEIGHT_STD
+     rpy_certain = np.arctan2(trans_std[1], trans[0]) < angle_std_threshold
+@@ -195,7 +222,14 @@
+     else:
+       height_certain = True
+ 
+-    certain_if_calib = (rpy_certain and height_certain) or (self.valid_blocks < INPUTS_NEEDED)
++    calibrating = self.valid_blocks < INPUTS_NEEDED
++    if DASHCAM:
++      # unusual camera heights: an uncertain road plane must not stop pitch/yaw learning
++      certain_if_calib = rpy_certain or calibrating
++      use_height = height_certain or calibrating
++    else:
++      certain_if_calib = (rpy_certain and height_certain) or calibrating
++      use_height = True
+     if not (straight_and_fast and certain_if_calib):
+       return None
+ 
+@@ -210,24 +244,32 @@
+     else:
+       new_wide_from_device_euler = WIDE_FROM_DEVICE_EULER_INIT
+ 
+-    if (len(road_transform_trans) == 3):
++    if (len(road_transform_trans) == 3) and use_height:
+       new_height = np.array([road_transform_trans[2]])
++    elif len(road_transform_trans) == 3:
++      new_height = self.height.copy()  # road plane uncertain: carry the current estimate
+     else:
+       new_height = HEIGHT_INIT
+ 
+-    self.rpys[self.block_idx] = moving_avg_with_linear_decay(self.rpys[self.block_idx], new_rpy, self.idx, float(BLOCK_SIZE))
+-    self.wide_from_device_eulers[self.block_idx] = moving_avg_with_linear_decay(self.wide_from_device_eulers[self.block_idx],
+-                                                                                new_wide_from_device_euler, self.idx, float(BLOCK_SIZE))
+-    self.heights[self.block_idx] = moving_avg_with_linear_decay(self.heights[self.block_idx], new_height, self.idx, float(BLOCK_SIZE))
++    avg = running_mean if DASHCAM else moving_avg_with_linear_decay
++    self.rpys[self.block_idx] = avg(self.rpys[self.block_idx], new_rpy, self.idx, float(BLOCK_SIZE))
++    self.wide_from_device_eulers[self.block_idx] = avg(self.wide_from_device_eulers[self.block_idx],
++                                                       new_wide_from_device_euler, self.idx, float(BLOCK_SIZE))
++    self.heights[self.block_idx] = avg(self.heights[self.block_idx], new_height, self.idx, float(BLOCK_SIZE))
+ 
+     self.idx = (self.idx + 1) % BLOCK_SIZE
+-    if self.idx == 0:
++    block_done = self.idx == 0
++    if block_done:
+       self.block_idx += 1
+       self.valid_blocks = max(self.block_idx, self.valid_blocks)
+       self.block_idx = self.block_idx % INPUTS_WANTED
+ 
+     self.update_status()
+ 
++    # dashcam: save after every block, slow vehicles that are switched off by cutting power keep their progress
++    if DASHCAM and block_done and self.param_put:
++      self.params.put("CalibrationParams", self.get_msg(True).to_bytes())
++
+     return new_rpy
+ 
+   def get_msg(self, valid: bool) -> capnp.lib.capnp._DynamicStructBuilder:
+@@ -258,24 +300,79 @@
+     pm.send('liveCalibration', self.get_msg(valid))
+ 
+ 
++def consume_reset_request(params: Params) -> bool:
++  try:
++    os.remove(dashcam_anywhere.RESET_CALIB_FLAG)  # remove first: a stuck flag must not reset every second
++  except FileNotFoundError:
++    return False
++  except OSError:
++    cloudlog.exception("calibrationd: cannot remove calibration reset flag, ignoring it")
++    return False
++  params.remove("CalibrationParams")
++  cloudlog.warning("calibrationd: calibration reset requested")
++  return True
++
++
++def reset_on_mode_change(params: Params) -> None:
++  # never carry a calibration between dashcam-anywhere mode and the normal car
++  marker = os.path.isfile(dashcam_anywhere.CALIB_MARKER)
++  try:
++    if DASHCAM and not marker:
++      params.remove("CalibrationParams")
++      open(dashcam_anywhere.CALIB_MARKER, "w").close()
++      cloudlog.warning("calibrationd: entered dashcam mode, calibration reset")
++    elif not DASHCAM and marker:
++      params.remove("CalibrationParams")
++      os.remove(dashcam_anywhere.CALIB_MARKER)
++      cloudlog.warning("calibrationd: left dashcam mode, calibration reset")
++  except OSError:
++    cloudlog.exception("calibrationd: dashcam calibration marker update failed")
++
++
+ def main() -> NoReturn:
+   config_realtime_process([0, 1, 2, 3], 5)
+ 
++  params_reader = Params()
++  gps_service = get_gps_location_service(params_reader)
++  extra = [gps_service] if DASHCAM else []
+   pm = messaging.PubMaster(['liveCalibration'])
+-  sm = messaging.SubMaster(['cameraOdometry', 'carState'], poll='cameraOdometry')
++  sm = messaging.SubMaster(['cameraOdometry', 'carState'] + extra, poll='cameraOdometry',
++                           ignore_alive=extra, ignore_avg_freq=extra, ignore_valid=extra)
+ 
+-  params_reader = Params()
+   CP = messaging.log_from_bytes(params_reader.get("CarParams", block=True), car.CarParams)
+-
++  # dashcam car (MOCK) has no wheel speed, use GPS when it has a good fix and visual odometry otherwise
++  alt_speed = DASHCAM and CP.brand == 'mock'
++  valid_services = ['cameraOdometry'] if alt_speed else ['cameraOdometry', 'carState']
++
++  # the dashcam-anywhere files are the real device's, skip them for prefixed params (replay, tests)
++  real_device = "OPENPILOT_PREFIX" not in os.environ
++  if real_device:
++    reset_on_mode_change(params_reader)
++    consume_reset_request(params_reader)  # before Calibrator() reads CalibrationParams
+   calibrator = Calibrator(param_put=True)
+   calibrator.not_car = CP.notCar
++  last_reset_check = time.monotonic()
+ 
+   while 1:
+     timeout = 0 if sm.frame == -1 else 100
+     sm.update(timeout)
++    now = time.monotonic()
++
++    # runtime reset only in dashcam mode, it makes the model warp jump
++    if DASHCAM and real_device and now - last_reset_check > 1.0:
++      last_reset_check = now
++      if consume_reset_request(params_reader):
++        calibrator.reset_calibration()
+ 
+     if sm.updated['cameraOdometry']:
+-      calibrator.handle_v_ego(sm['carState'].vEgo)
++      v_ego = sm['carState'].vEgo
++      if alt_speed:
++        v_ego = sm['cameraOdometry'].trans[0]
++        gps = sm[gps_service]
++        if sm.seen[gps_service] and (now - sm.recv_time[gps_service]) < GPS_MAX_AGE and \
++           gps.hasFix and gps.speedAccuracy < GPS_MAX_SPEED_STD:
++          v_ego = gps.speed
++      calibrator.handle_v_ego(v_ego)
+       new_rpy = calibrator.handle_cam_odom(sm['cameraOdometry'].trans,
+                                            sm['cameraOdometry'].rot,
+                                            sm['cameraOdometry'].wideFromDeviceEuler,
+@@ -288,7 +385,7 @@
+ 
+     # 4Hz driven by cameraOdometry
+     if sm.frame % 5 == 0:
+-      calibrator.send_data(pm, sm.all_checks())
++      calibrator.send_data(pm, sm.all_checks(valid_services))
+ 
+ 
+ if __name__ == "__main__":
+diff -ruN orig/selfdrive/locationd/test/test_calibrationd.py new/selfdrive/locationd/test/test_calibrationd.py
+--- orig/selfdrive/locationd/test/test_calibrationd.py	2026-10-03 15:13:34.872812609 -0400
++++ new/selfdrive/locationd/test/test_calibrationd.py	2026-10-03 15:50:43.375451793 -0400
+@@ -4,7 +4,10 @@
+ 
+ import cereal.messaging as messaging
+ from cereal import log
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.params import Params
++from openpilot.common.transformations.orientation import rot_from_euler, euler_from_rot
++import openpilot.selfdrive.locationd.calibrationd as calibrationd
+ from openpilot.selfdrive.locationd.calibrationd import Calibrator, INPUTS_NEEDED, INPUTS_WANTED, BLOCK_SIZE, MIN_SPEED_FILTER, \
+                                                          MAX_YAW_RATE_FILTER, SMOOTH_CYCLES, HEIGHT_INIT, MAX_ALLOWED_PITCH_SPREAD, MAX_ALLOWED_YAW_SPREAD
+ 
+@@ -14,7 +17,10 @@
+                      carstate_speed=MIN_SPEED_FILTER + 1,
+                      cam_odo_yr=0.0,
+                      cam_odo_speed_std=1e-3,
+-                     cam_odo_height_std=1e-3):
++                     cam_odo_height_std=1e-3,
++                     cam_odo_height=None):
++  if cam_odo_height is None:
++    cam_odo_height = HEIGHT_INIT.item()
+   old_rpy_weight_prev = 0.0
+   for _ in range(cycles):
+     assert (old_rpy_weight_prev - c.old_rpy_weight < 1/SMOOTH_CYCLES + 1e-3)
+@@ -26,7 +32,7 @@
+                         [0.0, 0.0, cam_odo_yr],
+                         [0.0, 0.0, 0.0],
+                         [cam_odo_speed_std, cam_odo_speed_std, cam_odo_speed_std],
+-                        [0.0, 0.0, HEIGHT_INIT.item()],
++                        [0.0, 0.0, cam_odo_height],
+                         [cam_odo_height_std, cam_odo_height_std, cam_odo_height_std])
+ 
+ class TestCalibrationd:
+@@ -80,7 +86,12 @@
+   def test_calibration_speed_std_height_reject(self):
+     c = Calibrator(param_put=False)
+     process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE * INPUTS_WANTED, cam_odo_height_std=1e3)
+-    assert c.valid_blocks == INPUTS_NEEDED
++    if calibrationd.DASHCAM:
++      # dashcam-anywhere: pitch/yaw keep learning, the uncertain height is carried
++      assert c.valid_blocks == INPUTS_WANTED
++      np.testing.assert_allclose(c.height, HEIGHT_INIT)
++    else:
++      assert c.valid_blocks == INPUTS_NEEDED
+     np.testing.assert_allclose(c.rpy, np.zeros(3))
+ 
+ 
+@@ -110,3 +121,131 @@
+     assert c.valid_blocks == 1
+     assert c.cal_status == log.LiveCalibrationData.Status.recalibrating
+     np.testing.assert_allclose(c.rpy, [0.0, 0.0, MAX_ALLOWED_YAW_SPREAD*1.1], atol=1e-2)
++
++
++DASHCAM_MIN_SPEED = 9 / 3.6
++
++
++def process_messages_feedback(c, calib, cycles, speed):
++  # like modeld: the observed motion is relative to the calibration currently in use
++  for _ in range(cycles):
++    resid = euler_from_rot(rot_from_euler(c.get_smooth_rpy()).T.dot(rot_from_euler(calib)))
++    c.handle_v_ego(speed)
++    c.handle_cam_odom([speed, np.sin(resid[2]) * speed, -np.sin(resid[1]) * speed],
++                      [0.0, 0.0, 0.0],
++                      [0.0, 0.0, 0.0],
++                      [1e-3, 1e-3, 1e-3],
++                      [0.0, 0.0, HEIGHT_INIT.item()],
++                      [1e-3, 1e-3, 1e-3])
++
++
++class TestCalibrationdDashcam:
++  # dashcam-anywhere code paths, independent of whether the device flag is set
++
++  def _dashcam(self, monkeypatch):
++    monkeypatch.setattr(calibrationd, "DASHCAM", True)
++    monkeypatch.setattr(calibrationd, "MIN_SPEED_FILTER", DASHCAM_MIN_SPEED)
++    monkeypatch.setattr(calibrationd, "MAX_VEL_ANGLE_STD", np.radians(1.0))
++
++  def test_low_speed_calibration(self, monkeypatch):
++    self._dashcam(monkeypatch)
++    c = Calibrator(param_put=False)
++    calib = [0.0, 0.03, -0.02]
++    process_messages_feedback(c, calib, BLOCK_SIZE * INPUTS_WANTED, DASHCAM_MIN_SPEED + 0.5)
++    assert c.valid_blocks == INPUTS_WANTED
++    assert c.cal_status == log.LiveCalibrationData.Status.calibrated
++    np.testing.assert_allclose(c.rpy, calib, atol=1e-3)
++
++  def test_below_dashcam_speed_reject(self, monkeypatch):
++    self._dashcam(monkeypatch)
++    c = Calibrator(param_put=False)
++    speed = DASHCAM_MIN_SPEED - 0.2
++    process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE * INPUTS_NEEDED, cam_odo_speed=speed, carstate_speed=speed)
++    assert c.valid_blocks == 0
++
++  def test_yaw_rate_gate_scales_with_speed(self, monkeypatch):
++    self._dashcam(monkeypatch)
++    speed = 3.0  # scaled limit: 2 deg/s * 3.0 / 6.7 = 0.9 deg/s
++    c = Calibrator(param_put=False)
++    process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE * INPUTS_NEEDED, cam_odo_speed=speed, carstate_speed=speed,
++                     cam_odo_yr=np.radians(1.5))
++    assert c.valid_blocks == 0
++    c = Calibrator(param_put=False)
++    process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE * INPUTS_NEEDED, cam_odo_speed=speed, carstate_speed=speed,
++                     cam_odo_yr=np.radians(0.5))
++    assert c.valid_blocks == INPUTS_NEEDED
++
++  def test_block_running_mean(self, monkeypatch):
++    self._dashcam(monkeypatch)
++    c = Calibrator(param_put=False)
++    speed = DASHCAM_MIN_SPEED + 1
++    process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE // 2, cam_odo_speed=speed, carstate_speed=speed)
++    process_messages(c, [0.0, 0.0, 0.02], BLOCK_SIZE // 2, cam_odo_speed=speed, carstate_speed=speed)
++    assert c.valid_blocks == 1
++    # every sample has the same weight, the stock linear decay would give ~0.02
++    np.testing.assert_allclose(c.rpys[0][2], 0.01, atol=1e-4)
++
++  def test_uncertain_height_is_carried(self, monkeypatch):
++    self._dashcam(monkeypatch)
++    c = Calibrator(param_put=False)
++    speed = DASHCAM_MIN_SPEED + 1
++    process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE * INPUTS_NEEDED, cam_odo_speed=speed, carstate_speed=speed,
++                     cam_odo_height=1.0)
++    np.testing.assert_allclose(c.height, [1.0], atol=1e-6)
++    process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE * INPUTS_WANTED, cam_odo_speed=speed, carstate_speed=speed,
++                     cam_odo_height=0.5, cam_odo_height_std=1e3)
++    assert c.valid_blocks == INPUTS_WANTED
++    np.testing.assert_allclose(c.height, [1.0], atol=1e-6)
++
++  def test_reset_calibration(self, monkeypatch):
++    self._dashcam(monkeypatch)
++    c = Calibrator(param_put=False)
++    speed = DASHCAM_MIN_SPEED + 1
++    process_messages(c, [0.0, 0.0, 0.0], BLOCK_SIZE * INPUTS_NEEDED, cam_odo_speed=speed, carstate_speed=speed)
++    process_messages(c, [0.0, MAX_ALLOWED_PITCH_SPREAD*1.1, 0.0], BLOCK_SIZE + 10, cam_odo_speed=speed, carstate_speed=speed)
++    assert c.cal_status == log.LiveCalibrationData.Status.recalibrating
++    c.reset_calibration()
++    assert c.valid_blocks == 0
++    assert c.cal_status == log.LiveCalibrationData.Status.uncalibrated
++    np.testing.assert_allclose(c.rpy, np.zeros(3))
++    np.testing.assert_allclose(c.height, HEIGHT_INIT)
++    assert c.get_msg(True).liveCalibration.calPerc == 0
++
++  def test_consume_reset_request(self, monkeypatch, tmp_path):
++    flag = tmp_path / "reset_calib"
++    monkeypatch.setattr(dashcam_anywhere, "RESET_CALIB_FLAG", str(flag))
++    params = Params()
++    params.put("CalibrationParams", messaging.new_message('liveCalibration').to_bytes(), block=True)
++    assert not calibrationd.consume_reset_request(params)
++    assert params.get("CalibrationParams") is not None
++    flag.touch()
++    assert calibrationd.consume_reset_request(params)
++    assert not flag.exists()
++    assert params.get("CalibrationParams") is None
++
++  def test_reset_on_mode_change(self, monkeypatch, tmp_path):
++    marker = tmp_path / "calib_from_dashcam"
++    monkeypatch.setattr(dashcam_anywhere, "CALIB_MARKER", str(marker))
++    params = Params()
++    calib = messaging.new_message('liveCalibration').to_bytes()
++
++    # normal car without marker: untouched
++    monkeypatch.setattr(calibrationd, "DASHCAM", False)
++    params.put("CalibrationParams", calib, block=True)
++    calibrationd.reset_on_mode_change(params)
++    assert params.get("CalibrationParams") is not None
++
++    # entering dashcam mode drops the car's calibration
++    monkeypatch.setattr(calibrationd, "DASHCAM", True)
++    calibrationd.reset_on_mode_change(params)
++    assert params.get("CalibrationParams") is None and marker.exists()
++
++    # staying in dashcam mode keeps the dashcam calibration
++    params.put("CalibrationParams", calib, block=True)
++    calibrationd.reset_on_mode_change(params)
++    assert params.get("CalibrationParams") is not None
++
++    # leaving dashcam mode drops it again
++    monkeypatch.setattr(calibrationd, "DASHCAM", False)
++    calibrationd.reset_on_mode_change(params)
++    assert params.get("CalibrationParams") is None and not marker.exists()
+diff -ruN orig/selfdrive/pandad/pandad.py new/selfdrive/pandad/pandad.py
+--- orig/selfdrive/pandad/pandad.py	2026-10-03 15:13:31.718793866 -0400
++++ new/selfdrive/pandad/pandad.py	2026-10-03 15:14:00.551965196 -0400
+@@ -7,6 +7,7 @@
+ import subprocess
+ 
+ from panda import Panda, PandaDFU, PandaProtocolMismatch, McuType, FW_PATH
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.basedir import BASEDIR
+ from openpilot.common.params import Params
+ from openpilot.system.hardware import HARDWARE
+@@ -99,6 +100,11 @@
+ 
+         # run real pandad
+         os.environ['MANAGER_DAEMON'] = 'pandad'
++        if dashcam_anywhere.enabled():
++          # no car: spoof ignition so the device goes onroad, and drop every sendcan in pandad.
++          # pandad only checks that these are set, never set them to '0'
++          os.environ['STARTED'] = '1'
++          os.environ['FAKESEND'] = '1'
+         process = subprocess.Popen(["./pandad"], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+         process.wait()
+     # TODO: wrap all panda exceptions in a base panda exception
+diff -ruN orig/selfdrive/selfdrived/selfdrived.py new/selfdrive/selfdrived/selfdrived.py
+--- orig/selfdrive/selfdrived/selfdrived.py	2026-10-03 15:13:33.519804569 -0400
++++ new/selfdrive/selfdrived/selfdrived.py	2026-10-03 15:50:43.375413508 -0400
+@@ -9,6 +9,7 @@
+ from msgq.visionipc import VisionIpcClient, VisionStreamType
+ 
+ 
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.params import Params
+ from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper, DT_CTRL
+ from openpilot.common.swaglog import cloudlog
+@@ -97,6 +98,7 @@
+     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
+ 
+     car_recognized = self.CP.brand != 'mock'
++    self.dashcam_anywhere = dashcam_anywhere.enabled()
+ 
+     # cleanup old params
+     if not self.CP.alphaLongitudinalAvailable:
+@@ -132,13 +134,17 @@
+     if HARDWARE.get_device_type() == 'mici':
+       self.startup_event = None
+     if not car_recognized:
+-      self.startup_event = EventName.startupNoCar
++      # dashcam-anywhere: the static Dashcam Mode banner is enough, there is no car or driver here
++      self.startup_event = None if self.dashcam_anywhere else EventName.startupNoCar
+     elif car_recognized and self.CP.passive:
+       self.startup_event = EventName.startupNoControl
+     elif self.CP.secOcRequired and not self.CP.secOcKeyAvailable:
+       self.startup_event = EventName.startupNoSecOcKey
+ 
+-    if not car_recognized:
++    if not car_recognized and self.dashcam_anywhere:
++      # intentional no-car dashcam, not an unrecognized car
++      self.events.add(EventName.dashcamMode, static=True)
++    elif not car_recognized:
+       self.events.add(EventName.carUnrecognized, static=True)
+       set_offroad_alert("Offroad_CarUnrecognized", True)
+     elif self.CP.passive:
+@@ -179,6 +185,15 @@
+ 
+     # Don't add any more events while in dashcam mode
+     if self.CP.passive:
++      if self.dashcam_anywhere:
++        # still show calibration progress, the device calibrates itself in this mode
++        cal_status = self.sm['liveCalibration'].calStatus
++        if cal_status == log.LiveCalibrationData.Status.uncalibrated:
++          self.events.add(EventName.calibrationIncomplete)
++        elif cal_status == log.LiveCalibrationData.Status.recalibrating:
++          self.events.add(EventName.calibrationRecalibrating)
++        elif cal_status == log.LiveCalibrationData.Status.invalid:
++          self.events.add(EventName.calibrationInvalid)
+       return
+ 
+     # Block resume if cruise never previously enabled
+diff -ruN orig/selfdrive/ui/layouts/settings/device.py new/selfdrive/ui/layouts/settings/device.py
+--- orig/selfdrive/ui/layouts/settings/device.py	2026-10-03 15:50:14.737636454 -0400
++++ new/selfdrive/ui/layouts/settings/device.py	2026-10-03 15:50:43.375355321 -0400
+@@ -2,6 +2,7 @@
+ import math
+ 
+ from cereal import messaging, log
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.basedir import BASEDIR
+ from openpilot.common.params import Params
+ from openpilot.common.swaglog import cloudlog
+@@ -101,6 +102,12 @@
+         return
+ 
+       self._params.remove("CalibrationParams")
++      if dashcam_anywhere.enabled():
++        # calibrationd saves after every block in this mode, make sure the restarted instance starts fresh
++        try:
++          open(dashcam_anywhere.RESET_CALIB_FLAG, "w").close()
++        except OSError:
++          cloudlog.exception("failed to request calibration reset")
+       self._params.remove("LiveTorqueParameters")
+       self._params.remove("LiveParameters")
+       self._params.remove("LiveParametersV2")
+diff -ruN orig/selfdrive/ui/ui_state.py new/selfdrive/ui/ui_state.py
+--- orig/selfdrive/ui/ui_state.py	2026-10-03 15:13:34.410809863 -0400
++++ new/selfdrive/ui/ui_state.py	2026-10-03 15:17:23.016580774 -0400
+@@ -5,6 +5,7 @@
+ from collections.abc import Callable
+ from enum import Enum
+ from cereal import messaging, car, log
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.filter_simple import FirstOrderFilter
+ from openpilot.common.params import Params
+ from openpilot.common.realtime import drop_realtime
+@@ -152,7 +153,8 @@
+       self.light_sensor = -1
+ 
+     # Update started state
+-    self.started = self.sm["deviceState"].started and self.ignition
++    # dashcam-anywhere: no real ignition, keep the onroad view while the panda reconnects
++    self.started = self.sm["deviceState"].started and (self.ignition or dashcam_anywhere.enabled())
+ 
+     # Update body state
+     if self.CP is not None and self.is_body != self.CP.notCar:
+diff -ruN orig/system/hardware/hardwared.py new/system/hardware/hardwared.py
+--- orig/system/hardware/hardwared.py	2026-10-03 15:13:32.178796600 -0400
++++ new/system/hardware/hardwared.py	2026-10-03 15:50:43.375260981 -0400
+@@ -12,6 +12,7 @@
+ import cereal.messaging as messaging
+ from cereal import log
+ from cereal.services import SERVICE_LIST
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.utils import strip_deprecated_keys
+ from openpilot.common.filter_simple import FirstOrderFilter
+ from openpilot.common.params import Params
+@@ -21,7 +22,7 @@
+ from openpilot.system.loggerd.config import get_available_percent
+ from openpilot.system.statsd import statlog
+ from openpilot.common.swaglog import cloudlog
+-from openpilot.system.hardware.power_monitoring import PowerMonitoring
++from openpilot.system.hardware.power_monitoring import PowerMonitoring, VBATT_PAUSE_CHARGING, VOLTAGE_SHUTDOWN_MIN_OFFROAD_TIME_S
+ from openpilot.system.hardware.fan_controller import FanController
+ from openpilot.system.version import terms_version, training_version
+ from openpilot.system.athena.registration import UNREGISTERED_DONGLE_ID
+@@ -182,6 +183,7 @@
+   offroad_temp_filter = FirstOrderFilter(0., TEMP_TAU, DT_HW, initialized=False)
+   should_start_prev = False
+   in_car = False
++  dashcam_low_voltage_ts: float | None = None
+   engaged_prev = False
+   pwrsave = False
+   offroad_cycle_count = 0
+@@ -220,10 +222,15 @@
+       in_car = pandaState.harnessStatus != log.PandaState.HarnessStatus.notConnected
+ 
+     elif (time.monotonic() - sm.recv_time['pandaStates']) > DISCONNECT_TIMEOUT:
+-      if onroad_conditions["ignition"]:
++      if onroad_conditions["ignition"] and not dashcam_anywhere.enabled():
+         onroad_conditions["ignition"] = False
+         cloudlog.error("panda timed out onroad")
+ 
++    # dashcam-anywhere: no ignition signal on a robot/test vehicle, stay onroad while powered.
++    # This also keeps recording through the panda resets pandad does before every (re)start.
++    if dashcam_anywhere.enabled():
++      onroad_conditions["ignition"] = True
++
+     # Run at 2Hz, plus either edge of ignition
+     ign_edge = (started_ts is not None) != all(onroad_conditions.values())
+     if (sm.frame % round(SERVICE_LIST['pandaStates'].frequency * DT_HW) != 0) and not ign_edge:
+@@ -318,6 +325,12 @@
+       # to make a different decision in your software
+       startup_conditions["registered_device"] = PC or (params.get("DongleId") != UNREGISTERED_DONGLE_ID)
+ 
++    # dashcam-anywhere: skip the checks that don't apply to an offline dashcam moved between vehicles.
++    # Thermal, disk space and onroad-cycle conditions still apply.
++    if dashcam_anywhere.enabled():
++      for k in ("up_to_date", "accepted_terms", "completed_training", "registered_device", "no_excessive_actuation"):
++        startup_conditions[k] = True
++
+     # Handle offroad/onroad transition
+     should_start = all(onroad_conditions.values())
+     if started_ts is None:
+@@ -382,6 +395,18 @@
+       cloudlog.warning(f"shutting device down, offroad since {off_ts}")
+       params.put_bool("DoShutdown", True, block=True)
+ 
++    # dashcam-anywhere never goes offroad, so the check above can't protect a car battery. Behind a car
++    # harness (12 V battery), still shut down on a low battery
++    if dashcam_anywhere.enabled() and in_car and power_monitor.car_voltage_mV < VBATT_PAUSE_CHARGING * 1e3 and \
++       not params.get_bool("DisablePowerDown"):
++      if dashcam_low_voltage_ts is None:
++        dashcam_low_voltage_ts = time.monotonic()
++      elif time.monotonic() - dashcam_low_voltage_ts > VOLTAGE_SHUTDOWN_MIN_OFFROAD_TIME_S:
++        cloudlog.warning(f"dashcam_anywhere: car battery low ({power_monitor.car_voltage_mV:.0f} mV), shutting down")
++        params.put_bool("DoShutdown", True, block=True)
++    else:
++      dashcam_low_voltage_ts = None
++
+     msg.deviceState.started = started_ts is not None
+     msg.deviceState.startedMonoTime = int(1e9*(started_ts or 0))
+ 
+diff -ruN orig/system/manager/process_config.py new/system/manager/process_config.py
+--- orig/system/manager/process_config.py	2026-10-03 15:13:33.950807130 -0400
++++ new/system/manager/process_config.py	2026-10-03 15:17:23.016447312 -0400
+@@ -3,6 +3,7 @@
+ import platform
+ 
+ from cereal import car
++from openpilot.common import dashcam_anywhere
+ from openpilot.common.params import Params
+ from openpilot.system.hardware import PC, TICI
+ from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
+@@ -121,3 +122,12 @@
+ ]
+ 
+ managed_processes = {p.name: p for p in procs}
++
++# dashcam-anywhere: forced onroad never goes through an offroad->onroad cycle, which is the only time
++# crashed processes are started again. Restart the ones recording and calibration depend on in place.
++DASHCAM_RESTART_IF_CRASH = ("camerad", "encoderd", "loggerd", "sensord", "micd", "qcomgpsd", "timed", "modeld",
++                            "dmonitoringmodeld", "dmonitoringd", "locationd", "calibrationd", "card", "selfdrived",
++                            "soundd", "hardwared", "pandad")
++if dashcam_anywhere.enabled():
++  for _name in DASHCAM_RESTART_IF_CRASH:
++    managed_processes[_name].restart_if_crash = True

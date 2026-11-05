@@ -1,0 +1,22 @@
+{
+  "ref": {
+    "latitude": 37.7749295,
+    "longitude": -122.4194155
+  },
+  "stop": 0,
+  "segments": [
+    {
+      "start": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "end": {
+        "x": 38.0,
+        "y": 28.88
+      },
+      "velocity": 8.0,
+      "radius": 49.644,
+      "direction": "left"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors / local tooling
+.claude/
+.vscode/
+.idea/
+.ipynb_checkpoints/
+.DS_Store
+
+# runtime output written by the tools (cp_export --out-dir ./cp_out, recv_log, ...)
+cp_out/
+*.tmp
+*.parquet
+reg_log.csv
+
+# device data: never publish (videos, rlogs/qlogs, params dumps, replay logs)
+data/
+replay_rlogs/
+robot_data/
+*.hevc
+*.zst
+*.ts
+*.mp4
+*.wav
+*.raw
+
+# model weights (Ultralytics YOLOv8 is AGPL-3.0): export/obtain them separately
+*.onnx
+*.pt

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>openpilot Control Module — planning to actuation, and porting to a bus</title>
+<style>
+  :root{--bg:#0f172a;--panel:#1e293b;--ink:#e2e8f0;--muted:#94a3b8;--accent:#facc15;
+        --accent2:#38bdf8;--good:#34d399;--bad:#fb7185;--line:#334155;--pur:#c4b5fd;}
+  *{box-sizing:border-box} html,body{margin:0;background:#020617;color:var(--ink);
+    font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;}
+  .slide{position:relative;width:100%;min-height:100vh;padding:48px 60px 60px;display:flex;flex-direction:column;
+    background:radial-gradient(1100px 460px at 85% -10%,rgba(250,204,21,.10),transparent 60%),
+      radial-gradient(900px 460px at -5% 110%,rgba(56,189,248,.10),transparent 60%),var(--bg);
+    border-bottom:1px solid #000;}
+  .kicker{color:var(--accent);font-weight:700;letter-spacing:.15em;font-size:13px;text-transform:uppercase}
+  h1{font-size:36px;line-height:1.12;margin:6px 0 4px} h2{font-size:27px;margin:6px 0 10px}
+  .sub{color:var(--muted);font-size:17px;margin:0 0 16px}
+  .row{display:flex;gap:22px;align-items:stretch} .col{flex:1}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+  .card h3{margin:0 0 8px;font-size:16px;color:var(--accent2)}
+  ul{margin:6px 0 0;padding-left:18px} li{margin:6px 0;font-size:15px;line-height:1.45}
+  code,.mono{font-family:ui-monospace,Menlo,monospace}
+  .eq{background:#0b1220;border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:8px 0;
+     font-family:ui-monospace,Menlo,monospace;font-size:15px;color:#e9f0ff;overflow-x:auto}
+  .tag{display:inline-block;background:#0b1220;border:1px solid var(--line);color:var(--accent2);
+    padding:2px 9px;border-radius:999px;font-size:12.5px;margin:0 5px 5px 0;font-family:ui-monospace,monospace}
+  .good{color:var(--good)} .bad{color:var(--bad)} .note{color:var(--muted);font-size:13px;margin-top:8px}
+  .flow{background:#0b1220;border:1px solid var(--line);border-radius:14px;padding:12px}
+  svg{width:100%;height:auto;display:block}
+  .pageno{position:absolute;right:24px;bottom:16px;color:var(--muted);font-size:12px}
+  .brand{position:absolute;left:60px;bottom:16px;color:var(--muted);font-size:12px} .brand b{color:var(--accent)}
+  table{border-collapse:collapse;width:100%;font-size:14px} td,th{border:1px solid var(--line);padding:6px 9px;text-align:left}
+  th{color:var(--accent);font-weight:700} .hint{position:fixed;right:12px;top:10px;background:#0b1220cc;
+    border:1px solid var(--line);color:var(--muted);font-size:12px;padding:5px 9px;border-radius:8px;z-index:9}
+  @media print{html,body{background:#fff}.slide{min-height:0;height:100vh;page-break-after:always;border:none}.hint{display:none}}
+</style></head>
+<body>
+<div class="hint">← / → &nbsp;·&nbsp; Print → Save as PDF</div>
+
+<!-- 1 -->
+<section class="slide">
+  <div class="kicker">openpilot · control module</div>
+  <h1>From Planning to Actuation — and porting it to a bus</h1>
+  <p class="sub">How openpilot turns a planned trajectory into steering torque, gas &amp; brake — evidence from sunnypilot 0.9.7.1 on a 2020 Honda&nbsp;Civic (Bosch)</p>
+  <div class="flow">
+    <svg viewBox="0 0 1180 250" role="img" aria-label="pipeline">
+      <defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#7dd3fc"/></marker>
+      <style>.b{fill:#111b2e;stroke:#3b4d6b;stroke-width:1.5;rx:12}.t{fill:#e2e8f0;font-size:14px;font-weight:700}.d{fill:#93a4bd;font-size:11.5px}.e{stroke:#7dd3fc;stroke-width:2.2;fill:none;marker-end:url(#a)}.hz{fill:#facc15;font-size:11px}</style></defs>
+      <rect class="b" x="10" y="90" width="180" height="72" rx="12"/><text class="t" x="26" y="120">Model plan</text><text class="d" x="26" y="140">modelV2.action</text><text class="d" x="26" y="155">.desiredCurvature</text>
+      <rect class="b" x="250" y="90" width="200" height="72" rx="12"/><text class="t" x="266" y="118">Lateral / Long</text><text class="d" x="266" y="138">controllers</text><text class="d" x="266" y="153">torque / accel PID</text>
+      <rect class="b" x="510" y="90" width="200" height="72" rx="12"/><text class="t" x="526" y="118">carControl</text><text class="d" x="526" y="138">.actuators.steer</text><text class="d" x="526" y="153">.accel</text>
+      <rect class="b" x="770" y="90" width="200" height="72" rx="12"/><text class="t" x="786" y="118">carController</text><text class="d" x="786" y="138">scale + rate-limit</text><text class="d" x="786" y="153">→ CAN frames</text>
+      <rect class="b" x="1030" y="90" width="140" height="72" rx="12"/><text class="t" x="1046" y="120">panda</text><text class="d" x="1046" y="140">safety → car</text>
+      <path class="e" d="M190 126 L250 126"/><path class="e" d="M450 126 L510 126"/><path class="e" d="M710 126 L770 126"/><path class="e" d="M970 126 L1030 126"/>
+      <text class="hz" x="250" y="80">100 Hz control loop</text>
+    </svg>
+  </div>
+  <div class="row" style="margin-top:14px">
+    <div class="col card"><h3>The one idea</h3>
+      <p style="font-size:15.5px">The model emits a <b>desired path curvature</b> (and a speed plan). Everything downstream is
+      <b>vehicle-specific execution</b>: turn curvature into a torque the EPS understands, turn the speed plan into an accel command.
+      <span class="good">The plan is transferable; the execution layer is not.</span></p>
+      <span class="tag">κ = desiredCurvature [1/m]</span><span class="tag">100 Hz</span><span class="tag">car: HONDA_CIVIC_BOSCH</span>
+    </div>
+  </div>
+  <div class="brand"><b>openpilot</b> control module</div><div class="pageno">1 / 6</div>
+</section>
+
+<!-- 2 -->
+<section class="slide">
+  <div class="kicker">lateral</div>
+  <h2>Curvature → steering torque</h2>
+  <p class="sub">This unit runs the <b>torque</b> controller (param <span class="mono">EnforceTorqueLateral=1</span>); there is no angle command.</p>
+  <div class="row">
+    <div class="col card"><h3>Controller (LatControlTorque)</h3>
+      <div class="eq">a_lat_des = κ · v²          # desired lateral accel</div>
+      <div class="eq">ff = a_lat / latAccelFactor + friction<br>&nbsp;&nbsp;&nbsp;= a_lat / 1.6917 + 0.2546</div>
+      <div class="eq">steer = PID(err, ff)   ∈ [−1, 1]  (kp 1.0, ki 0.1)</div>
+      <p class="note">latAccelFactor / friction from the car's torque table. Angle command ≡ 0 in torque mode.</p>
+    </div>
+    <div class="col card"><h3>Normalized → CAN torque</h3>
+      <div class="eq">clip curvature: rate ≤ MAX_LATERAL_JERK/v²  (jerk=5)</div>
+      <div class="eq">apply_steer = −steer × STEER_MAX<br>STEER_MAX = 4096   → CAN ±4096</div>
+      <p>Sent as <span class="mono">STEERING_CONTROL.STEER_TORQUE</span>. Final on-bus value =
+      <span class="mono">carOutput.actuatorsOutput.steerOutputCan</span>.</p>
+      <p class="note">Angle-controlled cars instead send a steering-angle target; the +/− and scaling differ per brand.</p>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px"><h3>Command vs feedback (what to log)</h3>
+    <p><span class="mono">carControl.steer</span> [−1,1] (cmd) → <span class="mono">steerOutputCan</span> ±4096 (sent) → <span class="mono">carState.steeringTorqueEps</span> (EPS actual). Compare sign/trend, not raw scale.</p>
+  </div>
+  <div class="brand"><b>openpilot</b> · lateral</div><div class="pageno">2 / 6</div>
+</section>
+
+<!-- 3 -->
+<section class="slide">
+  <div class="kicker">longitudinal</div>
+  <h2>Speed plan → gas / brake</h2>
+  <div class="row">
+    <div class="col card"><h3>LongControl</h3>
+      <div class="eq">err = v_target − v_ego  (from longitudinalPlan.speeds)</div>
+      <div class="eq">accel = PID(err, ff=a_target)   Bosch clip [−3.5, 2.0]</div>
+      <p>State machine: <span class="mono">off → pid → stopping → starting</span>. Output = <span class="mono">carControl.actuators.accel</span> [m/s²].</p>
+    </div>
+    <div class="col card"><h3>Reality on this car (stock PCM)</h3>
+      <ul>
+        <li><b class="bad">accel is computed but NOT sent to CAN.</b> <span class="mono">openpilotLongitudinalControl=False</span>.</li>
+        <li>openpilot only spoofs cruise buttons (<span class="mono">SCM_BUTTONS</span>) to change the stock ACC set-speed (<span class="mono">CustomStockLong=1</span>).</li>
+        <li>Even with OP long on, Bosch sends <span class="mono">ACC_CONTROL.ACCEL_COMMAND</span> (car's PCM executes) — no pedal % command.</li>
+        <li>Pedals are <b>measured only</b>: <span class="mono">carState.gas</span> (PEDAL_GAS), <span class="mono">carState.brake</span> (USER_BRAKE) — DBC units, shown as self-calibrated %.</li>
+      </ul>
+    </div>
+  </div>
+  <p class="note" style="margin-top:8px">Nidec Hondas differ: they compute gas/brake and send BRAKE_COMMAND + PCM_GAS. The command→actuation mapping is always brand-specific.</p>
+  <div class="brand"><b>openpilot</b> · longitudinal</div><div class="pageno">3 / 6</div>
+</section>
+
+<!-- 4 -->
+<section class="slide">
+  <div class="kicker">coordinate systems</div>
+  <h2>Frames &amp; transforms</h2>
+  <div class="row">
+    <div class="col" style="flex:1.05"><div class="flow">
+      <svg viewBox="0 0 520 300" role="img" aria-label="frames">
+        <rect x="0" y="0" width="520" height="300" rx="12" fill="#0a1020"/>
+        <!-- car frame axes -->
+        <g transform="translate(150,215)">
+          <line x1="0" y1="0" x2="0" y2="-120" stroke="#f5c542" stroke-width="3" marker-end="url(#a)"/>
+          <line x1="0" y1="0" x2="95" y2="0" stroke="#7ee787" stroke-width="3" marker-end="url(#a)"/>
+          <circle cx="0" cy="0" r="4" fill="#58a6ff"/>
+          <text x="8" y="-105" fill="#f5c542" font-size="14">x — forward</text>
+          <text x="60" y="-8" fill="#7ee787" font-size="14">y — right</text>
+          <text x="-40" y="16" fill="#8b949e" font-size="12">z down (into page)</text>
+          <text x="-18" y="18" fill="#58a6ff" font-size="12">ego</text>
+        </g>
+        <text x="300" y="70" fill="#e2e8f0" font-size="14" font-weight="700">Car / device frame</text>
+        <text x="300" y="92" fill="#93a4bd" font-size="12.5">x fwd, y RIGHT, z down</text>
+        <text x="300" y="120" fill="#93a4bd" font-size="12.5">model path &amp; lanes live here</text>
+        <text x="300" y="150" fill="#f5c542" font-size="12.5">κ &gt; 0 ⇒ turning right (+y)</text>
+        <text x="300" y="185" fill="#e2e8f0" font-size="14" font-weight="700">Global chain</text>
+        <text x="300" y="207" fill="#93a4bd" font-size="12.5">geodetic ↔ ECEF ↔ NED</text>
+        <text x="300" y="227" fill="#93a4bd" font-size="12.5">(lat/lon → local N/E/D)</text>
+      </svg>
+    </div></div>
+    <div class="col card"><h3>Curvature ↔ steer angle (bicycle model)</h3>
+      <div class="eq">κ = 1 / R  = yaw_rate / v</div>
+      <div class="eq">δ_wheel ≈ atan(L · κ)      (L = wheelbase)</div>
+      <div class="eq">δ_steer ≈ δ_wheel · steerRatio + offset</div>
+      <p>We publish a derived <span class="mono">desSteerAngleDeg</span> from κ so torque-mode cars still show an angle command
+      (L=2.7 m, steerRatio from liveParameters).</p>
+      <p class="note">Sign conventions verified in code: torque returns <span class="mono">−output</span> (left positive); carcontroller "positive when steering right".</p>
+    </div>
+  </div>
+  <div class="brand"><b>openpilot</b> · frames</div><div class="pageno">4 / 6</div>
+</section>
+
+<!-- 5 -->
+<section class="slide">
+  <div class="kicker">vehicle-agnostic output</div>
+  <h2>Frenet representation of the trajectory</h2>
+  <p class="sub">Two exports that any planner (any vehicle) can consume — no Honda units involved.</p>
+  <div class="row">
+    <div class="col card"><h3>1 · relative to lane center (s, d)</h3>
+      <div class="eq">reference = prob-weighted centerline of inner lanes<br>d(s) = signed lateral offset (+ = right)</div>
+      <p>Answers "where is the path within the lane." Falls back to the path itself when lanes are missing.</p>
+    </div>
+    <div class="col card"><h3>2 · arc-length path profile</h3>
+      <div class="eq">s, x, y, θ(s), κ(s), v(s), a(s)</div>
+      <p>Pure geometry + motion. <b class="good">This is the portable trajectory</b> — feed κ(s), v(s), a(s) to the bus planner directly.</p>
+    </div>
+    <div class="col card"><h3>Why it transfers</h3>
+      <ul><li>κ(s), v(s), a(s) are <b>physics</b>, not actuator units.</li>
+      <li>Each vehicle maps κ→its own steering, a→its own throttle/brake.</li>
+      <li>Exported as CSV via <span class="mono">frenet.to_csv()</span>.</li></ul>
+    </div>
+  </div>
+  <div class="brand"><b>openpilot</b> · Frenet</div><div class="pageno">5 / 6</div>
+</section>
+
+<!-- 6 -->
+<section class="slide">
+  <div class="kicker">porting</div>
+  <h2>Putting openpilot's planning on a bus</h2>
+  <div class="row">
+    <div class="col card"><h3 class="good" style="color:var(--good)">✅ Transfers (vehicle-independent)</h3>
+      <ul>
+        <li>Predicted trajectory / <b>κ(s), θ(s)</b></li>
+        <li>Speed &amp; accel profile <b>v(s), a(s)</b></li>
+        <li>Frenet (s, d) vs lane center</li>
+        <li>The perception → plan idea (curvature + speed target)</li>
+      </ul>
+    </div>
+    <div class="col card"><h3 class="bad" style="color:var(--bad)">🚫 Must be rebuilt for the bus</h3>
+      <ul>
+        <li>κ → steering: <b>bus kinematics</b> (long wheelbase, articulation), actuator (hydraulic/steer-by-wire) + its torque/angle scaling</li>
+        <li>a → throttle/brake: engine/retarder/air-brake maps</li>
+        <li><b>Safety layer</b> (panda equivalent), rate/limit tuning</li>
+        <li>Capability envelope: max lateral accel &amp; min turn radius are far tighter</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px"><h3>Transferability check (in <span class="mono">frenet_view.py</span>)</h3>
+    <p>Overlay required <span class="mono">|v²·κ(s)|</span> and κ(s) against the bus envelope
+    (<span class="mono">--bus-wheelbase --bus-max-steer-deg --bus-max-lat-acc</span>); segments the bus can't follow are shaded red →
+    tells you where openpilot's plan is infeasible for the bus <b>before</b> you actuate.</p>
+  </div>
+  <div class="brand"><b>openpilot</b> · porting to a bus</div><div class="pageno">6 / 6</div>
+</section>
+
+<script>
+  const s=[...document.querySelectorAll('.slide')];let i=0;
+  addEventListener('keydown',e=>{if(['ArrowRight','PageDown',' '].includes(e.key)){i=Math.min(s.length-1,i+1);s[i].scrollIntoView({behavior:'smooth'})}
+   if(['ArrowLeft','PageUp'].includes(e.key)){i=Math.max(0,i-1);s[i].scrollIntoView({behavior:'smooth'})}});
+  addEventListener('scroll',()=>{i=Math.round(scrollY/innerHeight)},{passive:true});
+</script>
+</body></html>
